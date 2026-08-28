@@ -3,6 +3,8 @@ package driver
 import (
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -25,6 +27,12 @@ type Pan115Client struct {
 	UploadMetaInfo    *UploadMetaInfo
 	UseInternalUpload bool
 	uaHandlingDone    bool
+
+	// ossTokenMu guards the cached OSS STS token so GetOSSToken can serve
+	// concurrent uploads without hammering the token endpoint.
+	ossTokenMu     sync.Mutex
+	ossToken       *UploadOSSTokenResp
+	ossTokenExpiry time.Time
 }
 
 // New creates Client with customized options.

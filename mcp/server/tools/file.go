@@ -126,11 +126,26 @@ type UploadFromURLArgs struct {
 	FileName string `json:"file_name,omitempty" jsonschema:"optional filename for the uploaded file, defaults to original filename"`
 }
 
-// UploadFromLocalArgs defines arguments for uploading from local file
+// UploadFromLocalArgs defines arguments for uploading a local file or directory
 type UploadFromLocalArgs struct {
-	LocalPath string `json:"local_path" jsonschema:"absolute path to the local file to upload"`
+	LocalPath string `json:"local_path" jsonschema:"absolute path to the local file or directory to upload"`
 	DirID     string `json:"dir_id" jsonschema:"target directory ID in 115 cloud"`
-	FileName  string `json:"file_name,omitempty" jsonschema:"optional filename for the uploaded file, defaults to original filename"`
+	FileName  string `json:"file_name,omitempty" jsonschema:"optional name for the uploaded file or folder, defaults to the source name"`
+}
+
+// folderUploadClient is the subset of Pan115Client operations needed to upload a
+// directory tree. It is implemented by *driver.Pan115Client and by fakes in tests.
+type folderUploadClient interface {
+	Mkdir(parentID, name string) (string, error)
+	RapidUploadOrByMultipart(dirID, fileName string, fileSize int64, r *os.File, opts ...driver.UploadMultipartOption) error
+}
+
+// folderUploadStats collects the outcome of a recursive folder upload.
+type folderUploadStats struct {
+	FoldersCreated int
+	FilesUploaded  int
+	Skipped        int
+	Errors         []string
 }
 
 // DownloadFileArgs defines arguments for downloading a file
@@ -200,7 +215,7 @@ func (ft *FileTools) RegisterTools(server *mcp.Server) {
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "upload_from_local",
-			Description: "Upload a local file to 115 cloud storage",
+			Description: "Upload a local file or directory (recursively) to 115 cloud storage",
 		}, ft.uploadFromLocal)
 	}
 
@@ -552,6 +567,14 @@ func (ft *FileTools) uploadFromLocal(ctx context.Context, req *mcp.CallToolReque
 		return toolError(fmt.Sprintf("Local file access denied: %v", err)), nil, nil
 	}
 
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return toolError(fmt.Sprintf("Failed to access local path: %v", err)), nil, nil
+	}
+	if info.IsDir() {
+		return ft.uploadFolderFromLocal(ctx, args, localPath, ft.client), nil, nil
+	}
+
 	// Open the local file
 	file, err := os.Open(localPath)
 	if err != nil {
@@ -637,6 +660,122 @@ func (ft *FileTools) uploadFromLocal(ctx context.Context, req *mcp.CallToolReque
 			},
 		},
 	}, nil, nil
+}
+
+// uploadFolderFromLocal uploads a local directory tree to 115. The root folder is
+// named after the source directory (or args.FileName when set). It returns an MCP
+// result summarizing created folders and uploaded files; partial failures are
+// reported as errors while remaining files are still attempted.
+func (ft *FileTools) uploadFolderFromLocal(ctx context.Context, args UploadFromLocalArgs, localPath string, client folderUploadClient) *mcp.CallToolResult {
+	folderName := args.FileName
+	if folderName == "" {
+		folderName = filepath.Base(localPath)
+	}
+
+	dirID, err := client.Mkdir(args.DirID, folderName)
+	if err != nil {
+		return toolError(fmt.Sprintf("Failed to create remote folder %q: %v", folderName, err))
+	}
+
+	stats := &folderUploadStats{}
+	ft.uploadFolderRecursive(ctx, localPath, dirID, client, stats)
+
+	result := map[string]interface{}{
+		"message":          fmt.Sprintf("Folder %q uploaded successfully: %d folders created, %d files uploaded", folderName, stats.FoldersCreated, stats.FilesUploaded),
+		"folder_name":      folderName,
+		"remote_folder_id": dirID,
+		"folders_created":  stats.FoldersCreated,
+		"files_uploaded":   stats.FilesUploaded,
+		"files_skipped":    stats.Skipped,
+	}
+	if len(stats.Errors) > 0 {
+		result["message"] = fmt.Sprintf("Folder %q uploaded with %d error(s): %d folders created, %d files uploaded", folderName, len(stats.Errors), stats.FoldersCreated, stats.FilesUploaded)
+		result["errors"] = stats.Errors
+		resultJSON, err := json.Marshal(result)
+		if err != nil {
+			return toolError(fmt.Sprintf("Failed to serialize result: %v", err))
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: string(resultJSON)},
+			},
+			IsError: true,
+		}
+	}
+
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return toolError(fmt.Sprintf("Failed to serialize result: %v", err))
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: string(resultJSON)},
+		},
+	}
+}
+
+// uploadFolderRecursive walks a local directory, creating a matching remote
+// folder for each local subdirectory and uploading every regular file. Symlinks
+// are skipped to avoid escaping the allowed local root or creating cycles.
+func (ft *FileTools) uploadFolderRecursive(ctx context.Context, localDir string, dir115ID string, client folderUploadClient, stats *folderUploadStats) {
+	entries, err := os.ReadDir(localDir)
+	if err != nil {
+		stats.Errors = append(stats.Errors, fmt.Sprintf("read directory %s: %v", localDir, err))
+		return
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			stats.Errors = append(stats.Errors, fmt.Sprintf("upload cancelled: %v", err))
+			return
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		childPath := filepath.Join(localDir, entry.Name())
+		if entry.IsDir() {
+			childID, err := client.Mkdir(dir115ID, entry.Name())
+			if err != nil {
+				stats.Errors = append(stats.Errors, fmt.Sprintf("create remote folder for %s: %v", childPath, err))
+				continue
+			}
+			stats.FoldersCreated++
+			ft.uploadFolderRecursive(ctx, childPath, childID, client, stats)
+			continue
+		}
+		if entry.Type().IsRegular() {
+			ft.uploadLocalFile(childPath, dir115ID, client, stats)
+			continue
+		}
+		// socket/FIFO/device entries cannot be uploaded; count them so users
+		// know something was skipped rather than silently dropped.
+		stats.Skipped++
+	}
+}
+
+// uploadLocalFile opens and uploads a single file into the remote directory,
+// recording any failure in stats so the surrounding folder upload continues.
+func (ft *FileTools) uploadLocalFile(localPath, dir115ID string, client folderUploadClient, stats *folderUploadStats) {
+	f, err := os.Open(localPath)
+	if err != nil {
+		stats.Errors = append(stats.Errors, fmt.Sprintf("open %s: %v", localPath, err))
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		stats.Errors = append(stats.Errors, fmt.Sprintf("stat %s: %v", localPath, err))
+		return
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		stats.Errors = append(stats.Errors, fmt.Sprintf("seek %s: %v", localPath, err))
+		return
+	}
+	if err := client.RapidUploadOrByMultipart(dir115ID, info.Name(), info.Size(), f); err != nil {
+		stats.Errors = append(stats.Errors, fmt.Sprintf("upload %s: %v", localPath, err))
+		return
+	}
+	stats.FilesUploaded++
 }
 
 func (ft *FileTools) downloadFile(ctx context.Context, req *mcp.CallToolRequest, args DownloadFileArgs) (*mcp.CallToolResult, any, error) {

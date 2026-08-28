@@ -145,11 +145,25 @@ func (c *Pan115Client) UploadByOSS(params *UploadOSSParams, r io.Reader, dirID s
 		return err
 	}
 
-	if err = bucket.PutObject(params.Object, r, OssOption(params, ossToken)...); err != nil {
+	var bodyBytes []byte
+	if err = bucket.PutObject(params.Object, r, append(OssOption(params, ossToken), oss.CallbackResult(&bodyBytes))...); err != nil {
 		return err
 	}
 
-	return c.checkUploadStatus(dirID, params.SHA1)
+	// Validate via the OSS callback result, avoiding a full GetFiles round trip.
+	// If the callback body is missing or unparseable, fall back to verifying via
+	// the directory listing as before.
+	var uploadResult UploadResult
+	if err = json.Unmarshal(bodyBytes, &uploadResult); err != nil {
+		return c.checkUploadStatus(dirID, params.SHA1)
+	}
+	if err = uploadResult.Err(string(bodyBytes)); err != nil {
+		return err
+	}
+	if uploadResult.Data.Sha1 != "" && !strings.EqualFold(uploadResult.Data.Sha1, params.SHA1) {
+		return ErrUploadFailed
+	}
+	return nil
 }
 
 func (c *Pan115Client) checkUploadStatus(dirID, sha1 string) error {
@@ -173,8 +187,72 @@ func (c *Pan115Client) checkUploadStatus(dirID, sha1 string) error {
 	return ErrUploadFailed
 }
 
-// GetOSSToken get oss token for oss upload
+// ossTokenRefreshBuffer makes GetOSSToken refresh the cached STS token before
+// its expiration instead of reusing a token that is about to expire mid-upload.
+const ossTokenRefreshBuffer = 10 * time.Minute
+
+// GetOSSToken returns a cached OSS STS token, requesting a fresh one only when
+// the cached token is missing or close to its expiration. Uses double-checked
+// locking so a slow token request never blocks other upload goroutines on the
+// mutex.
 func (c *Pan115Client) GetOSSToken() (*UploadOSSTokenResp, error) {
+	if token := c.cachedOSSToken(); token != nil {
+		return token, nil
+	}
+	// Fetch outside the lock: holding ossTokenMu across a network request would
+	// stall every consumer goroutine (and the main loop) on a hung token call.
+	token, err := c.fetchOSSToken()
+	if err != nil {
+		return nil, err
+	}
+	c.storeOSSToken(token)
+	return token, nil
+}
+
+// cachedOSSToken returns the cached token only while it still has enough life
+// left to finish an upload; otherwise it returns nil so the caller re-fetches.
+func (c *Pan115Client) cachedOSSToken() *UploadOSSTokenResp {
+	c.ossTokenMu.Lock()
+	defer c.ossTokenMu.Unlock()
+	if c.ossToken != nil && time.Until(c.ossTokenExpiry) > ossTokenRefreshBuffer {
+		return c.ossToken
+	}
+	return nil
+}
+
+// storeOSSToken records a freshly fetched token. If several goroutines fetch
+// concurrently, the freshest cached token wins; every fetched token is valid for
+// the same account, so returning the local one to the caller is safe.
+func (c *Pan115Client) storeOSSToken(token *UploadOSSTokenResp) {
+	c.ossTokenMu.Lock()
+	defer c.ossTokenMu.Unlock()
+	// Re-check under the lock: another goroutine may have stored a token while
+	// we were fetching.
+	if cached := c.ossToken; cached != nil && time.Until(c.ossTokenExpiry) > ossTokenRefreshBuffer {
+		return
+	}
+	c.ossToken = token
+	if token.Expiration.IsZero() {
+		// Expiration missing/unparsable: keep the cache permanently expired so
+		// every call re-fetches, i.e. a safe fallback to the pre-cache behavior.
+		c.ossTokenExpiry = time.Time{}
+	} else {
+		c.ossTokenExpiry = token.Expiration
+	}
+}
+
+// invalidateOSSToken drops any cached STS token. It must be called whenever the
+// credential changes on a reused client so uploads do not write into the
+// previous account's OSS bucket.
+func (c *Pan115Client) invalidateOSSToken() {
+	c.ossTokenMu.Lock()
+	c.ossToken = nil
+	c.ossTokenExpiry = time.Time{}
+	c.ossTokenMu.Unlock()
+}
+
+// fetchOSSToken always requests a fresh OSS STS token from 115.
+func (c *Pan115Client) fetchOSSToken() (*UploadOSSTokenResp, error) {
 	result := UploadOSSTokenResp{}
 	req := c.NewRequest().
 		ForceContentType("application/json;charset=UTF-8").
@@ -379,8 +457,10 @@ func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64
 			f(options)
 		}
 	}
+	if options.ThreadsNum < 1 {
+		options.ThreadsNum = 1
+	}
 
-	options.ThreadsNum = 1
 	if ossToken, err = c.GetOSSToken(); err != nil {
 		return err
 	}
@@ -404,6 +484,7 @@ func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64
 	defer ticker.Stop()
 	// 设置超时
 	timeout := time.NewTimer(options.Timeout)
+	defer timeout.Stop()
 
 	if chunks, err = SplitFile(f.Name(), fileSize); err != nil {
 		return err
@@ -413,7 +494,6 @@ func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64
 		oss.SetHeader(OssSecurityTokenHeaderName, ossToken.SecurityToken),
 		oss.UserAgentHeader(OSSUserAgent),
 		oss.EnableSha1(),
-		oss.Sequential(), // oss 启用Sequential必须按顺序上传, options.ThreadsNum = 1
 	); err != nil {
 		return err
 	}
@@ -422,52 +502,78 @@ func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64
 	wg.Add(len(chunks))
 
 	chunksCh := make(chan oss.FileChunk)
-	errCh := make(chan error)
+	// Buffered so a consumer reporting a failure (or the main loop returning on
+	// an earlier error) never blocks on the channel and leaks the goroutine.
+	errCh := make(chan error, options.ThreadsNum)
 	UploadedPartsCh := make(chan oss.UploadPart)
 	quit := make(chan struct{})
 
-	// producter
-	go chunksProducer(chunksCh, chunks)
+	// producter. Closing chunksCh lets consumers exit cleanly once every chunk
+	// has been handed out, instead of blocking on range forever.
+	go func() {
+		defer close(chunksCh)
+		chunksProducer(chunksCh, chunks)
+	}()
 	go func() {
 		wg.Wait()
-		quit <- struct{}{}
+		close(quit)
 	}()
 
-	// consumers
+	// consumers. Each goroutine uses its own token snapshot and error variable
+	// so concurrent part uploads do not race on the shared outer variables.
 	for i := 0; i < options.ThreadsNum; i++ {
 		go func(threadId int) {
 			defer func() {
 				if r := recover(); r != nil {
-					errCh <- fmt.Errorf("recovered in %v", r)
+					select {
+					case errCh <- fmt.Errorf("recovered in %v", r):
+					default:
+					}
 				}
 			}()
 			for chunk := range chunksCh {
-				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
+				token := ossToken // snapshot, refreshed per-chunk below
+				var part oss.UploadPart
+				var uploadErr error // 出现错误就继续尝试，共尝试3次
 				for retry := 0; retry < 3; retry++ {
 					select {
 					case <-ticker.C:
-						if ossToken, err = c.GetOSSToken(); err != nil { // 到时重新获取ossToken
-							errCh <- errors.Wrap(err, "刷新token时出现错误")
+						if refreshed, err := c.GetOSSToken(); err != nil { // 到时重新获取ossToken
+							select {
+							case errCh <- errors.Wrap(err, "刷新token时出现错误"):
+							default:
+							}
+						} else {
+							token = refreshed
 						}
 					default:
 					}
 
 					buf := make([]byte, chunk.Size)
-					if _, err = f.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
+					if _, err := f.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
+						uploadErr = err
 						continue
 					}
 
-					if part, err = bucket.UploadPart(
+					if part, uploadErr = bucket.UploadPart(
 						imur,
 						bytes.NewBuffer(buf),
 						chunk.Size,
 						chunk.Number,
-						OssOption(params, ossToken)...); err == nil {
+						OssOption(params, token)...); uploadErr == nil {
 						break
 					}
 				}
-				if err != nil {
-					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", f.Name(), chunk.Number, err))
+				if uploadErr != nil {
+					// Failed chunk: report and skip it. wg never reaches zero so
+					// the main loop returns via errCh; losing this send only
+					// happens when the buffer is already full, i.e. another
+					// error has already been reported.
+					select {
+					case errCh <- errors.Wrap(uploadErr, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", f.Name(), chunk.Number, uploadErr)):
+					default:
+					}
+					continue
 				}
 				UploadedPartsCh <- part
 			}
@@ -484,22 +590,27 @@ LOOP:
 	for {
 		select {
 		case <-ticker.C:
-			// 到时重新获取ossToken
-			if ossToken, err = c.GetOSSToken(); err != nil {
+			// 到时重新获取ossToken（仅预热缓存，consumer 各自通过
+			// GetOSSToken 获取，避免并发写共享变量）
+			if _, err := c.GetOSSToken(); err != nil {
 				return err
 			}
 		case <-quit:
 			break LOOP
-		case <-errCh:
+		case err := <-errCh:
 			return err
 		case <-timeout.C:
 			return fmt.Errorf("time out")
 		}
 	}
 
+	completeToken, err := c.GetOSSToken()
+	if err != nil {
+		return err
+	}
 	if _, err := bucket.CompleteMultipartUpload(imur, parts,
 		append(
-			OssOption(params, ossToken),
+			OssOption(params, completeToken),
 			oss.CallbackResult(&bodyBytes),
 		)...); err != nil {
 		return err

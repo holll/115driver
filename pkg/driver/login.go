@@ -51,6 +51,9 @@ func (c *Pan115Client) ImportCredential(cr *Credential) *Pan115Client {
 }
 
 func (c *Pan115Client) ImportCookies(cookies map[string]string, domains ...string) {
+	// A cookie replacement may point to a different account; drop any cached
+	// OSS STS token so it cannot be reused across credentials.
+	c.invalidateOSSToken()
 	for _, domain := range domains {
 		c.importCookies(cookies, domain, "/")
 	}

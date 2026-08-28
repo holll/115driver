@@ -45,6 +45,21 @@ func (p *Printer) PrintError(msg string, code int) int {
 	return code
 }
 
+// PrintResult writes an envelope carrying data and an optional error message. It
+// is used for outcomes that keep partial data but are not a clean success, e.g.
+// a batch operation that partially failed: machines see success=false with the
+// error field set, and still receive the partial data.
+func (p *Printer) PrintResult(data interface{}, errMsg string, code int) int {
+	if p.JSON {
+		p.printJSON(Envelope{Success: errMsg == "", Data: data, Error: errMsg, Code: code})
+		return code
+	}
+	if errMsg != "" {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", errMsg)
+	}
+	return code
+}
+
 func (p *Printer) printJSON(env Envelope) {
 	bytes, _ := json.MarshalIndent(env, "", "  ")
 	fmt.Println(string(bytes))

@@ -173,8 +173,9 @@ func DefalutUploadMultipartOptions() *UploadMultipartOptions {
 
 func DefaultUploadMultipartOptions() *UploadMultipartOptions {
 	return &UploadMultipartOptions{
-		// oss 启用Sequential必须按顺序上传
-		ThreadsNum:       1,
+		// Parts are uploaded in parallel (OSS assembles them by part number).
+		// Tune with UploadMultipartWithThreadsNum for very fast/slow networks.
+		ThreadsNum:       4,
 		Timeout:          time.Hour * 24,
 		TokenRefreshTime: time.Minute * 50,
 	}
