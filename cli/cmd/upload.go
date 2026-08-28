@@ -161,6 +161,7 @@ type uploadFolderClient interface {
 	Mkdir(parentID, name string) (string, error)
 	RapidUploadOrByMultipart(dirID, fileName string, fileSize int64, r *os.File, opts ...driver.UploadMultipartOption) error
 	RapidUploadOrByMultipartWithProgress(dirID, fileName string, fileSize int64, r *os.File, onUploadedParts func(current, total int), opts ...driver.UploadMultipartOption) error
+	RapidUploadOrByMultipartWithCallbacks(dirID, fileName string, fileSize int64, r *os.File, progress *driver.UploadMultipartProgressCallbacks, opts ...driver.UploadMultipartOption) error
 }
 
 // folderUploadSummary collects the outcome of a recursive folder upload.
@@ -242,18 +243,18 @@ func uploadLocalFile(client uploadFolderClient, localPath, dirID string, summary
 	}
 
 	if progress != nil {
-		progress.fileStart(filepath.Base(localPath))
+		progress.fileStart(filepath.Base(localPath), info.Size())
 	}
 
-	var uploaded int
-	err = client.RapidUploadOrByMultipartWithProgress(dirID, info.Name(), info.Size(), f, func(current, total int) {
-		if progress != nil {
-			progress.parts(current, total)
-		}
-	})
+	var callbacks *driver.UploadMultipartProgressCallbacks
 	if progress != nil {
-		progress.fileDone(uploaded)
+		callbacks = &driver.UploadMultipartProgressCallbacks{
+			Hash:          progress.hash,
+			UploadedParts: progress.parts,
+		}
 	}
+	err = client.RapidUploadOrByMultipartWithCallbacks(dirID, info.Name(), info.Size(), f, callbacks)
+	progress.fileDone()
 	if err != nil {
 		summary.errors = append(summary.errors, fmt.Sprintf("upload %s: %v", localPath, err))
 		return
@@ -262,35 +263,56 @@ func uploadLocalFile(client uploadFolderClient, localPath, dirID string, summary
 }
 
 // folderUploadProgress renders lightweight per-file feedback during a folder
-// upload: a header line with the file name, then a progress bar while the
-// multipart parts are transferred. All output is skipped for non-terminals or
-// JSON mode.
+// upload: a header line with the file name, a "Computing SHA1" bar while the
+// digest is calculated, then a part-based bar while multipart parts are
+// transferred. All output is skipped for non-terminals or JSON mode.
 type folderUploadProgress struct {
-	bar        *pb.ProgressBar
+	bar         *pb.ProgressBar
 	termChecked bool
 	isTerm      bool
 }
 
-func (p *folderUploadProgress) fileStart(name string) {
-	p.fileDone(0)
+func (p *folderUploadProgress) fileStart(name string, size int64) {
+	p.fileDone()
 	if jsonOutput || !p.terminal() {
 		return
 	}
 	fmt.Printf("Uploading %s...\n", name)
+	if p.bar == nil && size > 0 {
+		p.bar = output.CreateProgressBar(size)
+		if p.bar != nil {
+			p.bar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+			p.bar.Set("stage", "Computing SHA1")
+		}
+	}
 }
 
-// parts advances the progress bar to current/total uploaded parts. Off a
-// terminal CreateProgressBar returns nil and the call is a no-op.
+// hash advances the SHA1 digest progress bar (bytes hashed so far).
+func (p *folderUploadProgress) hash(n int64) {
+	if p.bar == nil || jsonOutput || !p.terminal() {
+		return
+	}
+	p.bar.SetCurrent(n)
+}
+
+// parts switches from the SHA1 bar to the transfer progress bar (parts
+// uploaded out of total) and advances it. Off a terminal CreateProgressBar
+// returns nil and calls are no-ops.
 func (p *folderUploadProgress) parts(current, total int) {
 	if jsonOutput || !p.terminal() {
 		return
+	}
+	if p.bar != nil {
+		p.bar.Finish()
+		p.bar = nil
 	}
 	if p.bar == nil {
 		p.bar = output.CreateProgressBar(int64(total))
 		if p.bar == nil {
 			return
 		}
-		p.bar.SetTemplateString(`{{counters . }} {{bar . }} {{percent . }}`)
+		p.bar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+		p.bar.Set("stage", "Uploading to 115")
 	}
 	p.bar.SetCurrent(int64(current))
 }
@@ -307,7 +329,7 @@ func (p *folderUploadProgress) terminal() bool {
 }
 
 // fileDone finalizes any active progress bar.
-func (p *folderUploadProgress) fileDone(int) {
+func (p *folderUploadProgress) fileDone() {
 	if p.bar != nil {
 		p.bar.Finish()
 		p.bar = nil

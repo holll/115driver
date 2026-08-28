@@ -40,6 +40,10 @@ func (f *fakeCLIUploadClient) RapidUploadOrByMultipart(dirID, fileName string, f
 }
 
 func (f *fakeCLIUploadClient) RapidUploadOrByMultipartWithProgress(dirID, fileName string, fileSize int64, r *os.File, onUploadedParts func(current, total int), opts ...driver.UploadMultipartOption) error {
+	return f.RapidUploadOrByMultipartWithCallbacks(dirID, fileName, fileSize, r, &driver.UploadMultipartProgressCallbacks{UploadedParts: onUploadedParts}, opts...)
+}
+
+func (f *fakeCLIUploadClient) RapidUploadOrByMultipartWithCallbacks(dirID, fileName string, fileSize int64, r *os.File, progress *driver.UploadMultipartProgressCallbacks, opts ...driver.UploadMultipartOption) error {
 	f.uploadCalls = append(f.uploadCalls, cliUploadCall{dirID, fileName, fileSize})
 	if f.failUploads[fileName] {
 		return errors.New("injected upload failure")

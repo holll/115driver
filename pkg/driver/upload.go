@@ -455,10 +455,25 @@ func (c *Pan115Client) RapidUploadOrByMultipart(dirID, fileName string, fileSize
 	return c.RapidUploadOrByMultipartWithProgress(dirID, fileName, fileSize, r, nil, opts...)
 }
 
-// RapidUploadOrByMultipartWithProgress is RapidUploadOrByMultipart with an
-// optional callback reporting how many multipart parts have been uploaded out
-// of the total. The callback may be nil to disable progress reporting.
+// UploadMultipartProgressCallbacks carries the optional progress callbacks for
+// RapidUploadOrByMultipartWithProgress. Hash reports bytes hashed during the
+// SHA1 digest phase; UploadedParts reports how many multipart parts have been
+// uploaded out of the total. Either callback may be nil.
+type UploadMultipartProgressCallbacks struct {
+	Hash          func(n int64)
+	UploadedParts func(current, total int)
+}
+
+// RapidUploadOrByMultipartWithProgress is RapidUploadOrByMultipart with
+// optional progress callbacks. The callbacks may be nil to disable progress
+// reporting.
 func (c *Pan115Client) RapidUploadOrByMultipartWithProgress(dirID, fileName string, fileSize int64, r *os.File, onUploadedParts func(current, total int), opts ...UploadMultipartOption) error {
+	return c.RapidUploadOrByMultipartWithCallbacks(dirID, fileName, fileSize, r, &UploadMultipartProgressCallbacks{UploadedParts: onUploadedParts}, opts...)
+}
+
+// RapidUploadOrByMultipartWithCallbacks is RapidUploadOrByMultipart with
+// optional Hash and UploadedParts progress callbacks; either may be nil.
+func (c *Pan115Client) RapidUploadOrByMultipartWithCallbacks(dirID, fileName string, fileSize int64, r *os.File, progress *UploadMultipartProgressCallbacks, opts ...UploadMultipartOption) error {
 	var (
 		err      error
 		digest   *hash.DigestResult
@@ -471,7 +486,11 @@ func (c *Pan115Client) RapidUploadOrByMultipartWithProgress(dirID, fileName stri
 	if fileSize > c.UploadMetaInfo.SizeLimit {
 		return ErrUploadTooLarge
 	}
-	if digest, err = c.GetDigestResult(r); err != nil {
+	var hashProgress func(int64)
+	if progress != nil {
+		hashProgress = progress.Hash
+	}
+	if digest, err = c.GetDigestResultWithProgress(r, hashProgress); err != nil {
 		return err
 	}
 	// 闪传
@@ -494,7 +513,11 @@ func (c *Pan115Client) RapidUploadOrByMultipartWithProgress(dirID, fileName stri
 		return c.UploadByOSSWithProgress(&fastInfo.UploadOSSParams, r, dirID, nil)
 	}
 	// 分片上传
-	return c.UploadByMultipartWithProgress(&fastInfo.UploadOSSParams, digest.Size, r, dirID, onUploadedParts, opts...)
+	var uploadedParts func(current, total int)
+	if progress != nil {
+		uploadedParts = progress.UploadedParts
+	}
+	return c.UploadByMultipartWithProgress(&fastInfo.UploadOSSParams, digest.Size, r, dirID, uploadedParts, opts...)
 }
 
 // UploadByMultipart upload by mutipart blocks
