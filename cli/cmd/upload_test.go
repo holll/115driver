@@ -145,6 +145,26 @@ func TestCLIUploadFolderSkipsSymlinks(t *testing.T) {
 	}
 }
 
+func TestSplitUploadArgsSeparatesSourcesAndRemoteDir(t *testing.T) {
+	sources, remote := splitUploadArgs([]string{"a.txt", "b.mp4", "/dest/dir"})
+	if len(sources) != 2 || sources[0] != "a.txt" || sources[1] != "b.mp4" {
+		t.Fatalf("unexpected sources: %v", sources)
+	}
+	if remote != "/dest/dir" {
+		t.Fatalf("unexpected remote dir: %q", remote)
+	}
+}
+
+func TestSplitUploadArgsSingleSource(t *testing.T) {
+	sources, remote := splitUploadArgs([]string{"single.mp4", "/dest"})
+	if len(sources) != 1 || sources[0] != "single.mp4" {
+		t.Fatalf("unexpected sources: %v", sources)
+	}
+	if remote != "/dest" {
+		t.Fatalf("unexpected remote dir: %q", remote)
+	}
+}
+
 func TestCLIUploadFolderRootMkdirFailureReturnsError(t *testing.T) {
 	root := t.TempDir()
 	writeCLITestFile(t, filepath.Join(root, "a.txt"), "a")

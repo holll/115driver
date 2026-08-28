@@ -239,6 +239,7 @@ Additional env vars: `DRIVER115_CONFIG` (config path), `DRIVER115_PROFILE` (prof
 # Upload & Download
 115driver upload /local/file /remote/dir
 115driver upload /local/folder /remote/dir     # recursively uploads a directory tree
+115driver upload /dir/*.mp4 /remote/dir        # uploads multiple sources (files and/or folders)
 115driver download /remote/file /local/dir
 115driver download /remote/file /local/dir --timeout 6h  # default 2h, 0 disables timeout
 
