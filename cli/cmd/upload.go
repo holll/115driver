@@ -9,6 +9,7 @@ import (
 	"github.com/SheltonZhu/115driver/cli/internal/output"
 	"github.com/SheltonZhu/115driver/cli/internal/resolver"
 	"github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/cheggaaa/pb/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -70,7 +71,39 @@ var uploadCmd = &cobra.Command{
 			fmt.Printf("Uploading %s (%s)...\n", fileName, output.FormatFileSize(info.Size()))
 		}
 
-		err = client.RapidUploadOrByOSS(dirID, fileName, info.Size(), f)
+		var hashBar, uploadBar *pb.ProgressBar
+		if !jsonOutput {
+			hashBar = output.CreateProgressBar(info.Size())
+			if hashBar != nil {
+				hashBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+				hashBar.Set("stage", "Computing SHA1")
+			}
+		}
+		progress := &driver.UploadProgressCallbacks{
+			Hash: func(n int64) {
+				if hashBar != nil {
+					hashBar.SetCurrent(n)
+				}
+			},
+			Upload: func(n int64) {
+				if hashBar != nil && uploadBar == nil {
+					hashBar.Finish()
+					hashBar = nil
+					uploadBar = output.CreateProgressBar(info.Size())
+					if uploadBar != nil {
+						uploadBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+						uploadBar.Set("stage", "Uploading to 115")
+					}
+				}
+				if uploadBar != nil {
+					uploadBar.SetCurrent(n)
+				}
+			},
+		}
+
+		err = client.RapidUploadOrByOSSWithProgress(dirID, fileName, info.Size(), f, progress)
+		output.FinishProgress(hashBar)
+		output.FinishProgress(uploadBar)
 		if err != nil {
 			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Upload failed: %v", err)}
 		}

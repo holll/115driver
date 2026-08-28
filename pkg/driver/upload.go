@@ -24,8 +24,14 @@ import (
 
 // GetDigestResult get digest of file or stream
 func (c *Pan115Client) GetDigestResult(r io.Reader) (*hash.DigestResult, error) {
+	return c.GetDigestResultWithProgress(r, nil)
+}
+
+// GetDigestResultWithProgress is GetDigestResult with an optional progress
+// callback reporting bytes hashed so far.
+func (c *Pan115Client) GetDigestResultWithProgress(r io.Reader, onProgress func(int64)) (*hash.DigestResult, error) {
 	d := hash.DigestResult{}
-	return &d, hash.Digest(r, &d)
+	return &d, hash.DigestWithProgress(r, &d, onProgress)
 }
 
 // GetUploadEndpoint get upload endPoint
@@ -73,8 +79,22 @@ func (c *Pan115Client) UploadFastOrByOSS(dirID, fileName string, fileSize int64,
 	return c.RapidUploadOrByOSS(dirID, fileName, fileSize, r)
 }
 
+// UploadProgressCallbacks reports upload progress. Hash is called with the
+// number of bytes hashed so far during the digest (SHA1) computation phase;
+// Upload is called with the number of bytes transferred to OSS.
+type UploadProgressCallbacks struct {
+	Hash   func(n int64)
+	Upload func(n int64)
+}
+
 // RapidUploadOrByOSS Upload By OSS when unable to rapid upload file
 func (c *Pan115Client) RapidUploadOrByOSS(dirID, fileName string, fileSize int64, r io.ReadSeeker) error {
+	return c.RapidUploadOrByOSSWithProgress(dirID, fileName, fileSize, r, nil)
+}
+
+// RapidUploadOrByOSSWithProgress is RapidUploadOrByOSS with optional progress
+// callbacks; both callbacks may be nil to disable progress reporting.
+func (c *Pan115Client) RapidUploadOrByOSSWithProgress(dirID, fileName string, fileSize int64, r io.ReadSeeker, progress *UploadProgressCallbacks) error {
 	var (
 		err      error
 		digest   *hash.DigestResult
@@ -87,7 +107,11 @@ func (c *Pan115Client) RapidUploadOrByOSS(dirID, fileName string, fileSize int64
 	if fileSize > c.UploadMetaInfo.SizeLimit {
 		return ErrUploadTooLarge
 	}
-	if digest, err = c.GetDigestResult(r); err != nil {
+	var hashProgress func(int64)
+	if progress != nil {
+		hashProgress = progress.Hash
+	}
+	if digest, err = c.GetDigestResultWithProgress(r, hashProgress); err != nil {
 		return err
 	}
 	// 闪传
@@ -105,7 +129,11 @@ func (c *Pan115Client) RapidUploadOrByOSS(dirID, fileName string, fileSize int64
 		return err
 	}
 	// 闪传失败，普通上传
-	return c.UploadByOSS(&fastInfo.UploadOSSParams, r, dirID)
+	var uploadProgress func(int64)
+	if progress != nil {
+		uploadProgress = progress.Upload
+	}
+	return c.UploadByOSSWithProgress(&fastInfo.UploadOSSParams, r, dirID, uploadProgress)
 }
 
 // getOSSEndpoint get oss endpoint 利用阿里云内网上传文件，需要在阿里云服务器上运行本程序，同时也需要115在服务器的所在地域开通了阿里云OSS
@@ -132,6 +160,12 @@ func (c *Pan115Client) GetOSSEndpoint(enableInternalUpload bool) string {
 
 // UploadByOSS use aliyun sdk to upload
 func (c *Pan115Client) UploadByOSS(params *UploadOSSParams, r io.Reader, dirID string) error {
+	return c.UploadByOSSWithProgress(params, r, dirID, nil)
+}
+
+// UploadByOSSWithProgress is UploadByOSS with an optional progress callback
+// reporting bytes uploaded to OSS so far.
+func (c *Pan115Client) UploadByOSSWithProgress(params *UploadOSSParams, r io.Reader, dirID string, onProgress func(int64)) error {
 	ossToken, err := c.GetOSSToken()
 	if err != nil {
 		return err
@@ -146,6 +180,9 @@ func (c *Pan115Client) UploadByOSS(params *UploadOSSParams, r io.Reader, dirID s
 	}
 
 	var bodyBytes []byte
+	if onProgress != nil {
+		r = &progressReader{r: r, onProgress: onProgress}
+	}
 	if err = bucket.PutObject(params.Object, r, append(OssOption(params, ossToken), oss.CallbackResult(&bodyBytes))...); err != nil {
 		return err
 	}
@@ -164,6 +201,21 @@ func (c *Pan115Client) UploadByOSS(params *UploadOSSParams, r io.Reader, dirID s
 		return ErrUploadFailed
 	}
 	return nil
+}
+
+// progressReader wraps a reader and reports the cumulative bytes read via
+// onProgress, used to surface OSS upload progress to callers.
+type progressReader struct {
+	r          io.Reader
+	onProgress func(n int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if p.onProgress != nil && n > 0 {
+		p.onProgress(int64(n))
+	}
+	return n, err
 }
 
 func (c *Pan115Client) checkUploadStatus(dirID, sha1 string) error {
