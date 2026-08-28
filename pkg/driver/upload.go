@@ -452,6 +452,13 @@ func (c *Pan115Client) UploadFastOrByMultipart(dirID, fileName string, fileSize 
 
 // RapidUploadOrByMultipart upload by mutipart blocks when unable to rapid upload
 func (c *Pan115Client) RapidUploadOrByMultipart(dirID, fileName string, fileSize int64, r *os.File, opts ...UploadMultipartOption) error {
+	return c.RapidUploadOrByMultipartWithProgress(dirID, fileName, fileSize, r, nil, opts...)
+}
+
+// RapidUploadOrByMultipartWithProgress is RapidUploadOrByMultipart with an
+// optional callback reporting how many multipart parts have been uploaded out
+// of the total. The callback may be nil to disable progress reporting.
+func (c *Pan115Client) RapidUploadOrByMultipartWithProgress(dirID, fileName string, fileSize int64, r *os.File, onUploadedParts func(current, total int), opts ...UploadMultipartOption) error {
 	var (
 		err      error
 		digest   *hash.DigestResult
@@ -484,14 +491,20 @@ func (c *Pan115Client) RapidUploadOrByMultipart(dirID, fileName string, fileSize
 
 	// 闪传失败，上传
 	if digest.Size <= KB { // 文件大小小于1KB，改用普通模式上传
-		return c.UploadByOSS(&fastInfo.UploadOSSParams, r, dirID)
+		return c.UploadByOSSWithProgress(&fastInfo.UploadOSSParams, r, dirID, nil)
 	}
 	// 分片上传
-	return c.UploadByMultipart(&fastInfo.UploadOSSParams, digest.Size, r, dirID, opts...)
+	return c.UploadByMultipartWithProgress(&fastInfo.UploadOSSParams, digest.Size, r, dirID, onUploadedParts, opts...)
 }
 
 // UploadByMultipart upload by mutipart blocks
 func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64, f *os.File, dirID string, opts ...UploadMultipartOption) error {
+	return c.UploadByMultipartWithProgress(params, fileSize, f, dirID, nil, opts...)
+}
+
+// UploadByMultipartWithProgress is UploadByMultipart with an optional callback
+// reporting how many multipart parts have been uploaded out of the total.
+func (c *Pan115Client) UploadByMultipartWithProgress(params *UploadOSSParams, fileSize int64, f *os.File, dirID string, onUploadedParts func(current, total int), opts ...UploadMultipartOption) error {
 	var (
 		chunks    []oss.FileChunk
 		parts     []oss.UploadPart
@@ -633,8 +646,13 @@ func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64
 	}
 
 	go func() {
+		uploadedParts := 0
 		for part := range UploadedPartsCh {
 			parts = append(parts, part)
+			uploadedParts++
+			if onUploadedParts != nil {
+				onUploadedParts(uploadedParts, len(chunks))
+			}
 			wg.Done()
 		}
 	}()

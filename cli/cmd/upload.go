@@ -129,6 +129,7 @@ func init() {
 type uploadFolderClient interface {
 	Mkdir(parentID, name string) (string, error)
 	RapidUploadOrByMultipart(dirID, fileName string, fileSize int64, r *os.File, opts ...driver.UploadMultipartOption) error
+	RapidUploadOrByMultipartWithProgress(dirID, fileName string, fileSize int64, r *os.File, onUploadedParts func(current, total int), opts ...driver.UploadMultipartOption) error
 }
 
 // folderUploadSummary collects the outcome of a recursive folder upload.
@@ -179,7 +180,7 @@ func walkFolder(localDir, dirID string, client uploadFolderClient, summary *fold
 			continue
 		}
 		if entry.Type().IsRegular() {
-			uploadLocalFile(client, childPath, dirID, summary)
+			uploadLocalFile(client, childPath, dirID, summary, &folderUploadProgress{})
 			continue
 		}
 		// socket/FIFO/device entries cannot be uploaded; count them so users
@@ -190,7 +191,8 @@ func walkFolder(localDir, dirID string, client uploadFolderClient, summary *fold
 
 // uploadLocalFile opens and uploads a single file into the remote directory,
 // recording any failure in summary so the surrounding folder upload continues.
-func uploadLocalFile(client uploadFolderClient, localPath, dirID string, summary *folderUploadSummary) {
+// progress, when non-nil, receives per-file lifecycle events for terminal UX.
+func uploadLocalFile(client uploadFolderClient, localPath, dirID string, summary *folderUploadSummary, progress *folderUploadProgress) {
 	f, err := os.Open(localPath)
 	if err != nil {
 		summary.errors = append(summary.errors, fmt.Sprintf("open %s: %v", localPath, err))
@@ -207,9 +209,76 @@ func uploadLocalFile(client uploadFolderClient, localPath, dirID string, summary
 		summary.errors = append(summary.errors, fmt.Sprintf("seek %s: %v", localPath, err))
 		return
 	}
-	if err := client.RapidUploadOrByMultipart(dirID, info.Name(), info.Size(), f); err != nil {
+
+	if progress != nil {
+		progress.fileStart(filepath.Base(localPath))
+	}
+
+	var uploaded int
+	err = client.RapidUploadOrByMultipartWithProgress(dirID, info.Name(), info.Size(), f, func(current, total int) {
+		if progress != nil {
+			progress.parts(current, total)
+		}
+	})
+	if progress != nil {
+		progress.fileDone(uploaded)
+	}
+	if err != nil {
 		summary.errors = append(summary.errors, fmt.Sprintf("upload %s: %v", localPath, err))
 		return
 	}
 	summary.filesUploaded++
+}
+
+// folderUploadProgress renders lightweight per-file feedback during a folder
+// upload: a header line with the file name, then a progress bar while the
+// multipart parts are transferred. All output is skipped for non-terminals or
+// JSON mode.
+type folderUploadProgress struct {
+	bar        *pb.ProgressBar
+	termChecked bool
+	isTerm      bool
+}
+
+func (p *folderUploadProgress) fileStart(name string) {
+	p.fileDone(0)
+	if jsonOutput || !p.terminal() {
+		return
+	}
+	fmt.Printf("Uploading %s...\n", name)
+}
+
+// parts advances the progress bar to current/total uploaded parts. Off a
+// terminal CreateProgressBar returns nil and the call is a no-op.
+func (p *folderUploadProgress) parts(current, total int) {
+	if jsonOutput || !p.terminal() {
+		return
+	}
+	if p.bar == nil {
+		p.bar = output.CreateProgressBar(int64(total))
+		if p.bar == nil {
+			return
+		}
+		p.bar.SetTemplateString(`{{counters . }} {{bar . }} {{percent . }}`)
+	}
+	p.bar.SetCurrent(int64(current))
+}
+
+// terminal reports whether stdout is a TTY. It is evaluated lazily so piping
+// output (e.g. into a log file) keeps the folder upload quiet.
+func (p *folderUploadProgress) terminal() bool {
+	if p.termChecked {
+		return p.isTerm
+	}
+	p.termChecked = true
+	p.isTerm = output.IsTerminal()
+	return p.isTerm
+}
+
+// fileDone finalizes any active progress bar.
+func (p *folderUploadProgress) fileDone(int) {
+	if p.bar != nil {
+		p.bar.Finish()
+		p.bar = nil
+	}
 }

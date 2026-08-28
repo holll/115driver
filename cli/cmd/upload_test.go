@@ -36,6 +36,10 @@ func (f *fakeCLIUploadClient) Mkdir(parentID, name string) (string, error) {
 }
 
 func (f *fakeCLIUploadClient) RapidUploadOrByMultipart(dirID, fileName string, fileSize int64, r *os.File, opts ...driver.UploadMultipartOption) error {
+	return f.RapidUploadOrByMultipartWithProgress(dirID, fileName, fileSize, r, nil, opts...)
+}
+
+func (f *fakeCLIUploadClient) RapidUploadOrByMultipartWithProgress(dirID, fileName string, fileSize int64, r *os.File, onUploadedParts func(current, total int), opts ...driver.UploadMultipartOption) error {
 	f.uploadCalls = append(f.uploadCalls, cliUploadCall{dirID, fileName, fileSize})
 	if f.failUploads[fileName] {
 		return errors.New("injected upload failure")

@@ -9,7 +9,7 @@ import (
 )
 
 func CreateProgressBar(total int64) *pb.ProgressBar {
-	if !isTerminal() {
+	if !IsTerminal() {
 		return nil
 	}
 	bar := pb.Start64(total)
@@ -17,7 +17,9 @@ func CreateProgressBar(total int64) *pb.ProgressBar {
 	return bar
 }
 
-func isTerminal() bool {
+// IsTerminal reports whether stdout is attached to a terminal (a TTY), which is
+// when interactive progress output is appropriate.
+func IsTerminal() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
 		return false
