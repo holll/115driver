@@ -25,7 +25,7 @@ A comprehensive Go library, CLI tool, and MCP server for [115 cloud storage](htt
 
 **Authentication** — Cookie-based login, QR code login, and user identity verification.
 
-**File Operations** — List, rename, move, copy, delete, download, upload (with rapid upload via SHA1 deduplication and multipart upload via Aliyun OSS), search with filters, and get file info/statistics.
+**File Operations** — List, rename, move, copy, delete, download, upload (with rapid upload via SHA1 deduplication and multipart upload via Aliyun OSS), recursive folder upload, search with filters, and get file info/statistics.
 
 **Offline Downloads** — Add HTTP, ED2K, and magnet link download tasks; list, delete, and clear tasks.
 
@@ -238,6 +238,7 @@ Additional env vars: `DRIVER115_CONFIG` (config path), `DRIVER115_PROFILE` (prof
 
 # Upload & Download
 115driver upload /local/file /remote/dir
+115driver upload /local/folder /remote/dir     # recursively uploads a directory tree
 115driver download /remote/file /local/dir
 115driver download /remote/file /local/dir --timeout 6h  # default 2h, 0 disables timeout
 
@@ -262,6 +263,11 @@ All commands support `--json` for machine-readable output:
 115driver --json stat /path/to/file
 115driver --json info
 ```
+
+For folder uploads, the JSON result includes `folders_created`, `files_uploaded`
+and `files_skipped`; when some files failed, the envelope carries
+`success:false` with an `errors` list and a non-zero exit code while still
+including the partial counts.
 
 ### Shell Completion
 
@@ -334,11 +340,18 @@ an earlier address cannot be reached.
 |----------|-------|
 | **Account** | `getAccountInfo` |
 | **Directory** | `listDirectory` |
-| **File** | `stat`, `download_file`, `get_download_info`; with `--allow-destructive-tools`: `mkdir`, `delete`, `rename`, `move`, `copy`, `upload_from_url`, `upload_from_local` |
+| **File** | `stat`, `download_file`, `get_download_info`; with `--allow-destructive-tools`: `mkdir`, `delete`, `rename`, `move`, `copy`, `upload_from_url`, `upload_from_local` (file or directory) |
 | **Search** | `search` |
 | **Offline** | `listOfflineTasks`; with `--allow-destructive-tools`: `addOfflineTaskURIs`, `deleteOfflineTasks`, `clearOfflineTasks` |
 | **Share** | `getShareSnap` |
 | **Recycle** | `listRecycleBin`; with `--allow-destructive-tools`: `revertRecycleBin`, `cleanRecycleBin` |
+
+`upload_from_local` accepts either a file or a directory: passing a directory
+recursively uploads the whole tree, creating a matching remote folder for each
+local subdirectory. The remote root folder is named after the source directory
+(or overridden with `file_name`); symlinks are skipped. Partial failures are
+reported in the result's `errors` list with `files_uploaded`/`folders_created`
+counts while the remaining files are still uploaded.
 
 ### Configure with Claude Desktop
 
