@@ -17,6 +17,16 @@ builds:
     goarch:
       - amd64
       - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      # Go only supports 32-bit arm on linux (and android); armv7 targets are
+      # Armbian/Debian boards such as the onecloud.
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
 
 archives:
   - name_template: >-
@@ -25,6 +35,7 @@ archives:
       {{- .Os }}_
       {{- if eq .Arch "amd64" }}x86_64
       {{- else if eq .Arch "arm64" }}aarch64
+      {{- else if eq .Arch "arm" }}armv7
       {{- else }}{{ .Arch }}{{ end }}
     files:
       - LICENSE
