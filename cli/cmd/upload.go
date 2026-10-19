@@ -302,7 +302,7 @@ func (p *folderUploadProgress) parts(current, total int) {
 	if jsonOutput || !p.terminal() {
 		return
 	}
-	if p.bar != nil {
+	if p.bar != nil && p.bar.Get("stage") != "Uploading to 115" {
 		p.bar.Finish()
 		p.bar = nil
 	}

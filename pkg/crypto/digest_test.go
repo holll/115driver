@@ -1,6 +1,8 @@
 package hash
 
 import (
+	"crypto/sha1"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -11,7 +13,7 @@ func TestDigestWithProgressReportsBytesHashed(t *testing.T) {
 	var calls int
 	result := &DigestResult{}
 	err := DigestWithProgress(strings.NewReader(content), result, func(n int64) {
-		total += n
+		total = n
 		calls++
 	})
 	if err != nil {
@@ -28,6 +30,43 @@ func TestDigestWithProgressReportsBytesHashed(t *testing.T) {
 	}
 	if result.PreID != result.QuickID {
 		t.Fatalf("small file should have PreID == QuickID, got %q != %q", result.PreID, result.QuickID)
+	}
+}
+
+func TestDigestWithProgressReportsCumulativeBytes(t *testing.T) {
+	for _, size := range []int{0, hashPreSize - 1, hashPreSize, hashPreSize + 1, hashPreSize * 4} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			content := strings.Repeat("a", size)
+			var current int64
+			var calls int
+			result := &DigestResult{}
+			err := DigestWithProgress(strings.NewReader(content), result, func(n int64) {
+				if n <= current || n > int64(size) {
+					t.Errorf("progress must increase within file size: previous=%d current=%d size=%d", current, n, size)
+				}
+				current = n
+				calls++
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current != int64(size) || result.Size != int64(size) {
+				t.Fatalf("expected %d bytes, got progress=%d size=%d", size, current, result.Size)
+			}
+			if size > hashPreSize && calls < 2 {
+				t.Fatalf("expected intermediate progress updates, got %d", calls)
+			}
+			preSize := size
+			if preSize > hashPreSize {
+				preSize = hashPreSize
+			}
+			if want := fmt.Sprintf("%X", sha1.Sum([]byte(content[:preSize]))); result.PreID != want {
+				t.Fatalf("PreID=%s, want %s", result.PreID, want)
+			}
+			if want := fmt.Sprintf("%X", sha1.Sum([]byte(content))); result.QuickID != want {
+				t.Fatalf("QuickID=%s, want %s", result.QuickID, want)
+			}
+		})
 	}
 }
 

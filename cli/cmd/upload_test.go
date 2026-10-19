@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/cheggaaa/pb/v3"
 )
 
 type cliMkdirCall struct{ parentID, name string }
@@ -166,6 +167,27 @@ func TestSplitUploadArgsSingleSource(t *testing.T) {
 	}
 	if remote != "/dest" {
 		t.Fatalf("unexpected remote dir: %q", remote)
+	}
+}
+
+func TestFolderUploadProgressReusesTransferBar(t *testing.T) {
+	previousJSON := jsonOutput
+	jsonOutput = false
+	t.Cleanup(func() { jsonOutput = previousJSON })
+
+	bar := pb.New64(10)
+	bar.Set("stage", "Uploading to 115")
+	progress := &folderUploadProgress{bar: bar, termChecked: true, isTerm: true}
+	t.Cleanup(progress.fileDone)
+
+	for _, current := range []int{1, 2, 5, 10} {
+		progress.parts(current, 10)
+		if progress.bar != bar {
+			t.Fatal("transfer updates must reuse the existing progress bar")
+		}
+		if got := bar.Current(); got != int64(current) {
+			t.Fatalf("progress=%d, want %d", got, current)
+		}
 	}
 }
 

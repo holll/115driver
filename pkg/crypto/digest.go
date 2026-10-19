@@ -30,8 +30,9 @@ func Digest(r io.Reader, result *DigestResult) (err error) {
 // letting callers render progress while a large file is being digested.
 func DigestWithProgress(r io.Reader, result *DigestResult, onProgress func(n int64)) (err error) {
 	h := sha1.New()
+	writer := &progressWriter{onProgress: onProgress, w: h}
 	// Calculate SHA1 hash of first 128K, which is used as PreID
-	result.Size, err = io.CopyN(progressWriter{onProgress, h}, r, hashPreSize)
+	result.Size, err = io.CopyN(writer, r, hashPreSize)
 	if err != nil && err != io.EOF {
 		return
 	}
@@ -40,7 +41,7 @@ func DigestWithProgress(r io.Reader, result *DigestResult, onProgress func(n int
 	// after reading the rest yields the full-file SHA1 used as QuickID.
 	if err == nil {
 		var n int64
-		if n, err = io.Copy(progressWriter{onProgress, h}, r); err != nil {
+		if n, err = io.Copy(writer, r); err != nil {
 			return
 		}
 		result.Size += n
@@ -51,17 +52,18 @@ func DigestWithProgress(r io.Reader, result *DigestResult, onProgress func(n int
 	return nil
 }
 
-// progressWriter forwards writes to the underlying writer and reports the
-// cumulative byte count via onProgress after every write chunk.
+// progressWriter 将写入转发给底层 writer，并在每次写入后报告累计字节数。
 type progressWriter struct {
 	onProgress func(n int64)
 	w          io.Writer
+	written    int64
 }
 
-func (p progressWriter) Write(b []byte) (int, error) {
+func (p *progressWriter) Write(b []byte) (int, error) {
 	n, err := p.w.Write(b)
-	if p.onProgress != nil {
-		p.onProgress(int64(n))
+	p.written += int64(n)
+	if p.onProgress != nil && n > 0 {
+		p.onProgress(p.written)
 	}
 	return n, err
 }
