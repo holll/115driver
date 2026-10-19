@@ -26,11 +26,15 @@ type VersionResp struct {
 type Versions map[string]map[string]any
 
 func (v Versions) GetAppVersions() []AppVersion {
-	vers := make([]AppVersion, len(v))
+	vers := make([]AppVersion, 0, len(v))
 	for app, ver := range v {
+		version, ok := ver["version_code"].(string)
+		if !ok {
+			continue
+		}
 		vers = append(vers, AppVersion{
 			AppName: app,
-			Version: ver["version_code"].(string),
+			Version: version,
 		})
 	}
 	return vers

@@ -76,8 +76,7 @@ var uploadCmd = &cobra.Command{
 		if len(errors) > 0 {
 			result["errors"] = errors
 			errMsg := fmt.Sprintf("%d of %d source(s) failed", len(errors), len(localPaths))
-			printer.PrintResult(result, errMsg, output.ExitError)
-			return &exitError{code: output.ExitError, msg: errMsg}
+			return &exitError{code: output.ExitError, msg: errMsg, data: result}
 		}
 		printer.PrintSuccess(result)
 		if !jsonOutput {

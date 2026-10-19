@@ -1,10 +1,37 @@
 package resolver
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/SheltonZhu/115driver/pkg/driver"
 )
+
+func TestResolveLocalDownloadPath(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing")
+	backslashTarget := missing + `\`
+	backslashWant := backslashTarget
+	if os.IsPathSeparator('\\') {
+		backslashWant = filepath.Join(backslashTarget, "remote.mp4")
+	}
+	for _, tt := range []struct{ name, target, want string }{
+		{"empty", "", "remote.mp4"},
+		{"existing directory", root, filepath.Join(root, "remote.mp4")},
+		{"missing slash directory", missing + "/", filepath.Join(missing, "remote.mp4")},
+		{"platform backslash", backslashTarget, backslashWant},
+		{"explicit file", missing + ".mp4", missing + ".mp4"},
+		{"extensionless file", missing, missing},
+		{"root directory", string(filepath.Separator), filepath.Join(string(filepath.Separator), "remote.mp4")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ResolveLocalDownloadPath(tt.target, "remote.mp4"); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestResolvePath_FallsBackToFileWhenDirLookupReturnsRootID(t *testing.T) {
 	client := fakeResolverClient{

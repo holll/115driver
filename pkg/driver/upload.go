@@ -2,6 +2,7 @@ package driver
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/base64"
@@ -36,7 +37,12 @@ func (c *Pan115Client) GetDigestResultWithProgress(r io.Reader, onProgress func(
 
 // GetUploadEndpoint get upload endPoint
 func (c *Pan115Client) GetUploadEndpoint(endpoint *UploadEndpointResp) error {
-	req := c.NewRequest().
+	return c.getUploadEndpointWithContext(context.Background(), endpoint)
+}
+
+func (c *Pan115Client) getUploadEndpointWithContext(ctx context.Context, endpoint *UploadEndpointResp) error {
+	req := c.Client.R().
+		SetContext(ctx).
 		ForceContentType("application/json;charset=UTF-8").
 		SetResult(&endpoint)
 	_, err := req.Get(ApiGetUploadEndpoint)
@@ -138,9 +144,13 @@ func (c *Pan115Client) RapidUploadOrByOSSWithProgress(dirID, fileName string, fi
 
 // getOSSEndpoint get oss endpoint 利用阿里云内网上传文件，需要在阿里云服务器上运行本程序，同时也需要115在服务器的所在地域开通了阿里云OSS
 func (c *Pan115Client) getOSSEndpoint(enableInternalUpload bool) string {
+	return c.getOSSEndpointWithContext(context.Background(), enableInternalUpload)
+}
+
+func (c *Pan115Client) getOSSEndpointWithContext(ctx context.Context, enableInternalUpload bool) string {
 	if enableInternalUpload {
 		uploadEndpoint := UploadEndpointResp{}
-		if err := c.GetUploadEndpoint(&uploadEndpoint); err != nil {
+		if err := c.getUploadEndpointWithContext(ctx, &uploadEndpoint); err != nil {
 			// TODO warn error log
 			return OSSEndpoint
 		}
@@ -208,12 +218,14 @@ func (c *Pan115Client) UploadByOSSWithProgress(params *UploadOSSParams, r io.Rea
 type progressReader struct {
 	r          io.Reader
 	onProgress func(n int64)
+	read       int64
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
+	p.read += int64(n)
 	if p.onProgress != nil && n > 0 {
-		p.onProgress(int64(n))
+		p.onProgress(p.read)
 	}
 	return n, err
 }
@@ -248,12 +260,19 @@ const ossTokenRefreshBuffer = 10 * time.Minute
 // locking so a slow token request never blocks other upload goroutines on the
 // mutex.
 func (c *Pan115Client) GetOSSToken() (*UploadOSSTokenResp, error) {
+	return c.getOSSTokenWithContext(context.Background())
+}
+
+func (c *Pan115Client) getOSSTokenWithContext(ctx context.Context) (*UploadOSSTokenResp, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if token := c.cachedOSSToken(); token != nil {
 		return token, nil
 	}
 	// Fetch outside the lock: holding ossTokenMu across a network request would
 	// stall every consumer goroutine (and the main loop) on a hung token call.
-	token, err := c.fetchOSSToken()
+	token, err := c.fetchOSSToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -304,9 +323,11 @@ func (c *Pan115Client) invalidateOSSToken() {
 }
 
 // fetchOSSToken always requests a fresh OSS STS token from 115.
-func (c *Pan115Client) fetchOSSToken() (*UploadOSSTokenResp, error) {
+func (c *Pan115Client) fetchOSSToken(ctx context.Context) (*UploadOSSTokenResp, error) {
 	result := UploadOSSTokenResp{}
-	req := c.NewRequest().
+	// 并行刷新只使用局部请求，避免写入共享的 c.Request。
+	req := c.Client.R().
+		SetContext(ctx).
 		ForceContentType("application/json;charset=UTF-8").
 		SetResult(&result)
 
@@ -548,15 +569,25 @@ func (c *Pan115Client) UploadByMultipartWithProgress(params *UploadOSSParams, fi
 	if options.ThreadsNum < 1 {
 		options.ThreadsNum = 1
 	}
+	if options.TokenRefreshTime <= 0 {
+		return fmt.Errorf("token refresh time must be positive")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), options.Timeout)
+	defer cancel()
 
-	if ossToken, err = c.GetOSSToken(); err != nil {
+	if ossToken, err = c.getOSSTokenWithContext(ctx); err != nil {
 		return err
 	}
 
+	endpoint := c.getOSSEndpointWithContext(ctx, c.UseInternalUpload)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if ossClient, err = oss.New(
-		c.getOSSEndpoint(c.UseInternalUpload),
+		endpoint,
 		ossToken.AccessKeyID,
 		ossToken.AccessKeySecret,
+		oss.SetCredentialsProvider(&ossTokenProvider{client: c}),
 		oss.EnableMD5(true),
 		oss.EnableCRC(true),
 	); err != nil {
@@ -567,144 +598,31 @@ func (c *Pan115Client) UploadByMultipartWithProgress(params *UploadOSSParams, fi
 		return err
 	}
 
-	// ossToken一小时后就会失效，所以每50分钟重新获取一次
-	ticker := time.NewTicker(options.TokenRefreshTime)
-	defer ticker.Stop()
-	// 设置超时
-	timeout := time.NewTimer(options.Timeout)
-	defer timeout.Stop()
-
 	if chunks, err = SplitFile(f.Name(), fileSize); err != nil {
 		return err
 	}
 
 	if imur, err = bucket.InitiateMultipartUpload(params.Object,
-		oss.SetHeader(OssSecurityTokenHeaderName, ossToken.SecurityToken),
+		oss.WithContext(ctx),
 		oss.UserAgentHeader(OSSUserAgent),
 		oss.EnableSha1(),
 	); err != nil {
 		return err
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(chunks))
-
-	chunksCh := make(chan oss.FileChunk)
-	// Buffered so a consumer reporting a failure (or the main loop returning on
-	// an earlier error) never blocks on the channel and leaks the goroutine.
-	errCh := make(chan error, options.ThreadsNum)
-	UploadedPartsCh := make(chan oss.UploadPart)
-	quit := make(chan struct{})
-
-	// producter. Closing chunksCh lets consumers exit cleanly once every chunk
-	// has been handed out, instead of blocking on range forever.
-	go func() {
-		defer close(chunksCh)
-		chunksProducer(chunksCh, chunks)
-	}()
-	go func() {
-		wg.Wait()
-		close(quit)
-	}()
-
-	// consumers. Each goroutine uses its own token snapshot and error variable
-	// so concurrent part uploads do not race on the shared outer variables.
-	for i := 0; i < options.ThreadsNum; i++ {
-		go func(threadId int) {
-			defer func() {
-				if r := recover(); r != nil {
-					select {
-					case errCh <- fmt.Errorf("recovered in %v", r):
-					default:
-					}
-				}
-			}()
-			for chunk := range chunksCh {
-				token := ossToken // snapshot, refreshed per-chunk below
-				var part oss.UploadPart
-				var uploadErr error // 出现错误就继续尝试，共尝试3次
-				for retry := 0; retry < 3; retry++ {
-					select {
-					case <-ticker.C:
-						if refreshed, err := c.GetOSSToken(); err != nil { // 到时重新获取ossToken
-							select {
-							case errCh <- errors.Wrap(err, "刷新token时出现错误"):
-							default:
-							}
-						} else {
-							token = refreshed
-						}
-					default:
-					}
-
-					buf := make([]byte, chunk.Size)
-					if _, err := f.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
-						uploadErr = err
-						continue
-					}
-
-					if part, uploadErr = bucket.UploadPart(
-						imur,
-						bytes.NewBuffer(buf),
-						chunk.Size,
-						chunk.Number,
-						OssOption(params, token)...); uploadErr == nil {
-						break
-					}
-				}
-				if uploadErr != nil {
-					// Failed chunk: report and skip it. wg never reaches zero so
-					// the main loop returns via errCh; losing this send only
-					// happens when the buffer is already full, i.e. another
-					// error has already been reported.
-					select {
-					case errCh <- errors.Wrap(uploadErr, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", f.Name(), chunk.Number, uploadErr)):
-					default:
-					}
-					continue
-				}
-				UploadedPartsCh <- part
-			}
-		}(i)
-	}
-
-	go func() {
-		uploadedParts := 0
-		for part := range UploadedPartsCh {
-			parts = append(parts, part)
-			uploadedParts++
-			if onUploadedParts != nil {
-				onUploadedParts(uploadedParts, len(chunks))
-			}
-			wg.Done()
-		}
-	}()
-LOOP:
-	for {
-		select {
-		case <-ticker.C:
-			// 到时重新获取ossToken（仅预热缓存，consumer 各自通过
-			// GetOSSToken 获取，避免并发写共享变量）
-			if _, err := c.GetOSSToken(); err != nil {
-				return err
-			}
-		case <-quit:
-			break LOOP
-		case err := <-errCh:
-			return err
-		case <-timeout.C:
-			return fmt.Errorf("time out")
-		}
-	}
-
-	completeToken, err := c.GetOSSToken()
+	parts, err = c.uploadMultipartParts(ctx, bucket, params, imur, f, chunks, options.ThreadsNum, options.TokenRefreshTime, onUploadedParts)
 	if err != nil {
+		return err
+	}
+
+	if _, err := c.getOSSTokenWithContext(ctx); err != nil {
 		return err
 	}
 	if _, err := bucket.CompleteMultipartUpload(imur, parts,
 		append(
-			OssOption(params, completeToken),
+			OssOption(params, nil),
 			oss.CallbackResult(&bodyBytes),
+			oss.WithContext(ctx),
 		)...); err != nil {
 		return err
 	}
@@ -716,9 +634,119 @@ LOOP:
 	return uploadResult.Err(string(bodyBytes))
 }
 
-func chunksProducer(ch chan oss.FileChunk, chunks []oss.FileChunk) {
+// uploadMultipartParts 在调用协程中收集进度，所有退出路径都取消并等待 worker。
+func (c *Pan115Client) uploadMultipartParts(ctx context.Context, bucket *oss.Bucket, params *UploadOSSParams, imur oss.InitiateMultipartUploadResult, f *os.File, chunks []oss.FileChunk, threads int, refreshTime time.Duration, onUploadedParts func(current, total int)) ([]oss.UploadPart, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	ticker := time.NewTicker(refreshTime)
+	defer ticker.Stop()
+
+	type partResult struct {
+		part oss.UploadPart
+		err  error
+	}
+	jobs := make(chan oss.FileChunk, len(chunks))
 	for _, chunk := range chunks {
-		ch <- chunk
+		jobs <- chunk
+	}
+	close(jobs)
+	results := make(chan partResult, threads)
+	var workers sync.WaitGroup
+	workers.Add(threads)
+	for i := 0; i < threads; i++ {
+		go func() {
+			report := func(result partResult) {
+				select {
+				case results <- result:
+				case <-ctx.Done():
+				}
+			}
+			defer workers.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					report(partResult{err: fmt.Errorf("multipart worker panic: %v", p)})
+				}
+			}()
+			for {
+				var chunk oss.FileChunk
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					chunk = job
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				buf := make([]byte, chunk.Size)
+				if n, err := f.ReadAt(buf, chunk.Offset); int64(n) != chunk.Size || err != nil {
+					if err == nil {
+						err = io.ErrUnexpectedEOF
+					}
+					report(partResult{err: errors.Wrap(err, "read upload part")})
+					return
+				}
+				var part oss.UploadPart
+				var uploadErr error
+				for retry := 0; retry < 3; retry++ {
+					if _, err := c.getOSSTokenWithContext(ctx); err != nil {
+						report(partResult{err: err})
+						return
+					}
+					part, uploadErr = bucket.UploadPart(imur, bytes.NewReader(buf), chunk.Size, chunk.Number,
+						append(OssOption(params, nil), oss.WithContext(ctx))...)
+					if uploadErr == nil {
+						break
+					}
+					if ctx.Err() != nil {
+						return
+					}
+				}
+				if uploadErr != nil {
+					report(partResult{err: errors.Wrapf(uploadErr, "upload %s part %d", f.Name(), chunk.Number)})
+					return
+				}
+				report(partResult{part: part})
+			}
+		}()
+	}
+	joined := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(results)
+		close(joined)
+	}()
+	defer func() {
+		cancel()
+		<-joined
+	}()
+
+	parts := make([]oss.UploadPart, 0, len(chunks))
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			if _, err := c.getOSSTokenWithContext(ctx); err != nil {
+				return nil, err
+			}
+		case result, ok := <-results:
+			if !ok {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return parts, nil
+			}
+			if result.err != nil {
+				return nil, result.err
+			}
+			parts = append(parts, result.part)
+			if onUploadedParts != nil {
+				onUploadedParts(len(parts), len(chunks))
+			}
+		}
 	}
 }
 
@@ -732,7 +760,7 @@ func SplitFile(filePath string, fileSize int64) (chunks []oss.FileChunk, err err
 			break
 		}
 	}
-	if fileSize > 9*GB { // 文件大小大于9GB时分为10000片
+	if fileSize >= 9*GB { // 文件大小不小于9GB时分为10000片
 		if chunks, err = oss.SplitFileByPartNum(filePath, 10000); err != nil {
 			return
 		}
@@ -747,12 +775,42 @@ func SplitFile(filePath string, fileSize int64) (chunks []oss.FileChunk, err err
 }
 
 // OssOption get options
+type ossTokenCredentials struct {
+	token *UploadOSSTokenResp
+}
+
+func (c ossTokenCredentials) GetAccessKeyID() string     { return c.token.AccessKeyID }
+func (c ossTokenCredentials) GetAccessKeySecret() string { return c.token.AccessKeySecret }
+func (c ossTokenCredentials) GetSecurityToken() string   { return c.token.SecurityToken }
+
+type ossTokenProvider struct {
+	client *Pan115Client
+}
+
+func (p *ossTokenProvider) GetCredentials() oss.Credentials {
+	credentials, _ := p.GetCredentialsE()
+	return credentials
+}
+
+func (p *ossTokenProvider) GetCredentialsE() (oss.Credentials, error) {
+	p.client.ossTokenMu.Lock()
+	token := p.client.ossToken
+	p.client.ossTokenMu.Unlock()
+	if token == nil {
+		return nil, fmt.Errorf("missing OSS credentials")
+	}
+	// SDK 签名时一次性读取整组凭据，避免刷新时混用不同批次的 AK/SK/token。
+	return ossTokenCredentials{token: token}, nil
+}
+
 func OssOption(params *UploadOSSParams, ossToken *UploadOSSTokenResp) []oss.Option {
 	options := []oss.Option{
-		oss.SetHeader(OssSecurityTokenHeaderName, ossToken.SecurityToken),
 		oss.Callback(base64.StdEncoding.EncodeToString([]byte(params.Callback.Callback))),
 		oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(params.Callback.CallbackVar))),
 		oss.UserAgentHeader(OSSUserAgent),
+	}
+	if ossToken != nil {
+		options = append(options, oss.SetHeader(OssSecurityTokenHeaderName, ossToken.SecurityToken))
 	}
 	return options
 }

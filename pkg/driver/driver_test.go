@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -30,18 +31,29 @@ func TestImportFromCookie(t *testing.T) {
 }
 
 func TestLoginErr(t *testing.T) {
+	requireIntegration(t)
 	assert.Error(t, New().ImportCredential(&Credential{}).LoginCheck())
 }
 
 func TestBadCookie(t *testing.T) {
+	requireIntegration(t)
 	assert.Error(t, New().ImportCredential(&Credential{}).CookieCheck())
 }
 
+func requireIntegration(t *testing.T) {
+	t.Helper()
+	if os.Getenv("DRIVER115_INTEGRATION") != "1" || strings.TrimSpace(cookieStr) == "" {
+		t.Skip("真实接口测试需显式设置 DRIVER115_INTEGRATION=1 且 COOKIE 非空")
+	}
+}
+
 func teardown(t *testing.T) func(t *testing.T) {
+	t.Helper()
+	requireIntegration(t)
 	cr := &Credential{}
-	assert.Nil(t, cr.FromCookie(cookieStr))
-	client = New(UA(UA115Browser), WithDebug(), WithTrace()).ImportCredential(cr)
-	assert.Nil(t, client.CookieCheck())
+	require.NoError(t, cr.FromCookie(cookieStr))
+	client = New(UA(UA115Browser)).ImportCredential(cr)
+	require.NoError(t, client.CookieCheck())
 	return func(t *testing.T) {}
 }
 
@@ -223,6 +235,7 @@ func TestGetUploadInfo(t *testing.T) {
 }
 
 func TestGetUPloadEndpoint(t *testing.T) {
+	requireIntegration(t)
 	result := UploadEndpointResp{}
 	assert.NoError(t, New().GetUploadEndpoint(&result))
 	assert.NotEmpty(t, result)
@@ -335,7 +348,7 @@ func TestGet(t *testing.T) {
 
 func TestQRCodeStart(t *testing.T) {
 	t.Skip()
-	c := New(WithTrace(), WithDebug())
+	c := New()
 	s, err := c.QRCodeStart()
 	assert.Nil(t, err)
 
@@ -364,7 +377,7 @@ func TestQRCodeStart(t *testing.T) {
 
 func TestQRCodeStartByOtherApp(t *testing.T) {
 	t.Skip()
-	c := New(WithTrace(), WithDebug())
+	c := New()
 	s, err := c.QRCodeStart()
 	assert.Nil(t, err)
 

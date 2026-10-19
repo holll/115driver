@@ -110,8 +110,9 @@ func ResolveLocalDownloadPath(localTarget, fileName string) string {
 		return filepath.Join(localTarget, fileName)
 	}
 
-	if strings.HasSuffix(localTarget, string(filepath.Separator)) {
-		return filepath.Join(strings.TrimSuffix(localTarget, string(filepath.Separator)), fileName)
+	// Windows 同时支持两种分隔符，Unix 的反斜杠仍属于合法文件名。
+	if os.IsPathSeparator(localTarget[len(localTarget)-1]) {
+		return filepath.Join(localTarget, fileName)
 	}
 
 	return localTarget

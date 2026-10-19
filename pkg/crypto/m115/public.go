@@ -3,6 +3,7 @@ package m115
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"io"
 )
 
@@ -35,8 +36,14 @@ func Decode(input string, key Key) (output []byte, err error) {
 	if err != nil {
 		return
 	}
+	if len(data) == 0 || len(data)%_KeyLength != 0 {
+		return nil, errors.New("m115: invalid RSA block length")
+	}
 	// RSA decrypt
 	data = rsaDecrypt(data)
+	if len(data) < len(key) {
+		return nil, errors.New("m115: decoded data is shorter than key")
+	}
 	// XOR decode
 	output = make([]byte, len(data)-16)
 	copy(output, data[16:])

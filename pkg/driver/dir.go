@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/go-resty/resty/v2"
@@ -36,6 +37,9 @@ const MaxDirPageLimit = 1150
 
 // ListWithLimit list all files and directories with limit
 func (c *Pan115Client) ListWithLimit(dirID string, limit int64, opts ...ListOption) (*[]File, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list: limit must be positive, got %d", limit)
+	}
 	if isCalledByAlistV3() {
 		return nil, ErrorNotSupportAlist
 	}

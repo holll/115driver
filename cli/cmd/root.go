@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -21,6 +24,8 @@ var (
 
 // Set via -ldflags at build time
 var version = "dev"
+
+var newCLIClient = driver.New
 
 var client *driver.Pan115Client
 var printer *output.Printer
@@ -56,9 +61,14 @@ var rootCmd = &cobra.Command{
 		if debugMode {
 			opts = append(opts, driver.WithDebug())
 		}
-		client = driver.New(opts...).ImportCredential(cr)
+		client = newCLIClient(opts...).ImportCredential(cr)
 
 		if _, err := client.GetUser(); err != nil {
+			var netErr net.Error
+			var urlErr *url.Error
+			if errors.As(err, &netErr) || errors.As(err, &urlErr) {
+				return &exitError{code: output.ExitNetwork, msg: fmt.Sprintf("Network request failed: %v", err)}
+			}
 			return &exitError{code: output.ExitAuth, msg: fmt.Sprintf("Authentication failed: %v\nRun '115driver login' to re-authenticate.", err)}
 		}
 		return nil
@@ -68,6 +78,7 @@ var rootCmd = &cobra.Command{
 type exitError struct {
 	code int
 	msg  string
+	data interface{}
 }
 
 func (e *exitError) Error() string {
@@ -98,6 +109,9 @@ func Execute() int {
 
 	if err := rootCmd.Execute(); err != nil {
 		if ee, ok := err.(*exitError); ok {
+			if ee.data != nil {
+				return printer.PrintResult(ee.data, ee.msg, ee.code)
+			}
 			return printer.PrintError(ee.msg, ee.code)
 		}
 		return printer.PrintError(err.Error(), output.ExitError)

@@ -208,6 +208,67 @@ func TestMCPHTTPClientRejectsUnsafeRedirect(t *testing.T) {
 	}
 }
 
+func TestSharedAddressRangeValidation(t *testing.T) {
+	tests := []struct {
+		address string
+		unsafe  bool
+	}{
+		{"100.64.0.0", true},
+		{"100.100.100.200", true},
+		{"100.127.255.255", true},
+		{"100.63.255.255", false},
+		{"100.128.0.0", false},
+		{"::ffff:100.64.0.0", true},
+		{"::ffff:100.100.100.200", true},
+		{"::ffff:100.127.255.255", true},
+		{"::ffff:100.63.255.255", false},
+		{"::ffff:100.128.0.0", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.address, func(t *testing.T) {
+			ip := net.ParseIP(tt.address)
+			if ip == nil {
+				t.Fatal("invalid test IP")
+			}
+			if got := isUnsafeIP(ip); got != tt.unsafe {
+				t.Errorf("isUnsafeIP = %v, want %v", got, tt.unsafe)
+			}
+
+			// 只调用校验函数和重定向回调，不发送真实网络请求。
+			rawURL := "http://" + net.JoinHostPort(tt.address, "80") + "/file.bin"
+			if _, err := validateUploadURL(rawURL); (err != nil) != tt.unsafe {
+				t.Errorf("validateUploadURL error = %v, want rejection %v", err, tt.unsafe)
+			}
+			ips := []net.IP{ip}
+			if err := validateResolvedIPs("example.com", ips); (err != nil) != tt.unsafe {
+				t.Errorf("validateResolvedIPs error = %v, want rejection %v", err, tt.unsafe)
+			}
+			client := newMCPHTTPClient(time.Second)
+			req := &http.Request{URL: mustParseURL(t, rawURL)}
+			if err := client.CheckRedirect(req, nil); (err != nil) != tt.unsafe {
+				t.Errorf("CheckRedirect error = %v, want rejection %v", err, tt.unsafe)
+			}
+
+			if tt.unsafe {
+				// 混合解析结果中的共享地址必须使整个拨号失败，不能先连接公网地址。
+				ips = append([]net.IP{net.ParseIP("100.128.0.0")}, ips...)
+				attempted := false
+				conn, err := dialResolvedIPs(context.Background(), "tcp", "example.com", "80", ips, func(context.Context, string, string) (net.Conn, error) {
+					attempted = true
+					return nil, errors.New("unexpected dial")
+				})
+				if conn != nil {
+					conn.Close()
+				}
+				if err == nil || attempted {
+					t.Errorf("expected rejection before dialing, got error %v, attempted %v", err, attempted)
+				}
+			}
+		})
+	}
+}
+
 func TestValidateResolvedIPsRejectsPrivateAddress(t *testing.T) {
 	if err := validateResolvedIPs("example.com", []net.IP{net.ParseIP("10.0.0.1")}); err == nil {
 		t.Fatal("expected private resolved IP to be rejected")

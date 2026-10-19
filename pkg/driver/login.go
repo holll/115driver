@@ -18,7 +18,10 @@ func (c *Pan115Client) CookieCheck() error {
 		SetQueryParam("_", NowMilli().String()).
 		SetResult(&result)
 
-	if _, _ = req.Get(ApiStatusCheck); !result.State {
+	if _, err := req.Get(ApiStatusCheck); err != nil {
+		return err
+	}
+	if !result.State {
 		return ErrBadCookie
 	}
 	return nil

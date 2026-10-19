@@ -956,6 +956,10 @@ func dialResolvedIPs(ctx context.Context, network, host, port string, ips []net.
 }
 
 func isUnsafeIP(ip net.IP) bool {
+	// 共享地址段 100.64.0.0/10 不属于 IsPrivate；To4 同时覆盖 IPv4 映射 IPv6。
+	if ipv4 := ip.To4(); ipv4 != nil && ipv4[0] == 100 && ipv4[1] >= 64 && ipv4[1] <= 127 {
+		return true
+	}
 	return ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
