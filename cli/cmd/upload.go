@@ -57,7 +57,7 @@ var uploadCmd = &cobra.Command{
 				continue
 			}
 
-			ok, err := uploadSingleFile(client, localPath, info.Size(), dirID)
+			ok, err := uploadSingleFile(client, localPath, info.Size(), dirID, remoteDir)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("upload %s: %v", localPath, err))
 				continue
@@ -89,7 +89,7 @@ var uploadCmd = &cobra.Command{
 // uploadSingleFile uploads one local file into dirID, rendering a two-stage
 // progress bar (SHA1 digest, then OSS transfer) on a terminal. It returns
 // whether the upload succeeded.
-func uploadSingleFile(client *driver.Pan115Client, localPath string, size int64, dirID string) (bool, error) {
+func uploadSingleFile(client *driver.Pan115Client, localPath string, size int64, dirID, remoteDir string) (bool, error) {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return false, fmt.Errorf("cannot open local file: %w", err)
@@ -160,7 +160,7 @@ func uploadSingleFile(client *driver.Pan115Client, localPath string, size int64,
 		return false, fmt.Errorf("upload failed: %w", err)
 	}
 	if !jsonOutput {
-		fmt.Printf("Upload complete: %s -> %s\n", fileName, dirID)
+		fmt.Printf("Upload complete: %s -> %s\n", fileName, remoteDir)
 	}
 	return true, nil
 }
