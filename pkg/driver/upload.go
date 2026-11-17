@@ -690,7 +690,16 @@ func (c *Pan115Client) uploadMultipartParts(ctx context.Context, bucket *oss.Buc
 				}
 				var part oss.UploadPart
 				var uploadErr error
-				for retry := 0; retry < 3; retry++ {
+				for retry := 0; retry < 5; retry++ {
+					if retry > 0 {
+						timer := time.NewTimer(time.Duration(retry) * 2 * time.Second)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						case <-timer.C:
+						}
+					}
 					if _, err := c.getOSSTokenWithContext(ctx); err != nil {
 						report(partResult{err: err})
 						return

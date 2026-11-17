@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/SheltonZhu/115driver/pkg/driver"
@@ -167,6 +168,42 @@ func TestSplitUploadArgsSingleSource(t *testing.T) {
 	}
 	if remote != "/dest" {
 		t.Fatalf("unexpected remote dir: %q", remote)
+	}
+}
+
+func TestFolderUploadProgressFormatsBytesButCountsParts(t *testing.T) {
+	previousJSON, previousStdout := jsonOutput, os.Stdout
+	sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonOutput, os.Stdout = false, sink
+	t.Cleanup(func() {
+		jsonOutput, os.Stdout = previousJSON, previousStdout
+		sink.Close()
+	})
+
+	progress := &folderUploadProgress{termChecked: true, isTerm: true}
+	t.Cleanup(progress.fileDone)
+	progress.fileStart("large.bin", 9754295947)
+	if progress.bar == nil {
+		t.Fatal("expected hash progress bar")
+	}
+	progress.hash(5218598912)
+	if !progress.bar.GetBool(pb.Bytes) {
+		t.Fatal("hash progress must use byte units")
+	}
+	rendered := progress.bar.String()
+	if !strings.Contains(rendered, "4.86 GiB / 9.08 GiB") || !strings.Contains(rendered, "B/s") {
+		t.Fatalf("expected readable capacity and byte speed, got %q", rendered)
+	}
+
+	progress.parts(3, 10)
+	if progress.bar == nil || progress.bar.GetBool(pb.Bytes) {
+		t.Fatal("multipart progress must count parts, not bytes")
+	}
+	if rendered := progress.bar.String(); !strings.Contains(rendered, "3 / 10") {
+		t.Fatalf("expected part counters, got %q", rendered)
 	}
 }
 

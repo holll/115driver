@@ -106,7 +106,8 @@ func uploadSingleFile(client *driver.Pan115Client, localPath string, size int64,
 	if !jsonOutput {
 		hashBar = output.CreateProgressBar(size)
 		if hashBar != nil {
-			hashBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+			hashBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . "%s/s" "? B/s" }}`)
+			hashBar.Set(pb.Bytes, true)
 			hashBar.Set("stage", "Computing SHA1")
 		}
 	}
@@ -122,7 +123,8 @@ func uploadSingleFile(client *driver.Pan115Client, localPath string, size int64,
 				hashBar = nil
 				uploadBar = output.CreateProgressBar(size)
 				if uploadBar != nil {
-					uploadBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+					uploadBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . "%s/s" "? B/s" }}`)
+					uploadBar.Set(pb.Bytes, true)
 					uploadBar.Set("stage", "Uploading to 115")
 				}
 			}
@@ -132,7 +134,26 @@ func uploadSingleFile(client *driver.Pan115Client, localPath string, size int64,
 		},
 	}
 
-	err = client.RapidUploadOrByOSSWithProgress(dirID, fileName, size, f, progress)
+	if size >= 5*driver.GB {
+		err = client.RapidUploadOrByMultipartWithCallbacks(dirID, fileName, size, f, &driver.UploadMultipartProgressCallbacks{
+			Hash: progress.Hash,
+			UploadedParts: func(current, total int) {
+				if uploadBar == nil {
+					progress.Upload(0)
+					if uploadBar != nil {
+						uploadBar.Set(pb.Bytes, false)
+						uploadBar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+						uploadBar.SetTotal(int64(total))
+					}
+				}
+				if uploadBar != nil {
+					uploadBar.SetCurrent(int64(current))
+				}
+			},
+		})
+	} else {
+		err = client.RapidUploadOrByOSSWithProgress(dirID, fileName, size, f, progress)
+	}
 	output.FinishProgress(hashBar)
 	output.FinishProgress(uploadBar)
 	if err != nil {
@@ -280,7 +301,8 @@ func (p *folderUploadProgress) fileStart(name string, size int64) {
 	if p.bar == nil && size > 0 {
 		p.bar = output.CreateProgressBar(size)
 		if p.bar != nil {
-			p.bar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . }}`)
+			p.bar.SetTemplateString(`{{string . "stage" }} {{counters . }} {{bar . }} {{percent . }} {{speed . "%s/s" "? B/s" }}`)
+			p.bar.Set(pb.Bytes, true)
 			p.bar.Set("stage", "Computing SHA1")
 		}
 	}

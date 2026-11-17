@@ -146,11 +146,12 @@ func TestMultipartWorkersReportAllParts(t *testing.T) {
 
 func TestMultipartWorkersCancelAndJoinOnFailure(t *testing.T) {
 	started := make(chan struct{})
-	var active atomic.Int64
+	var active, attempts atomic.Int64
 	bucket := newMultipartTestBucket(t, func(req *http.Request) (*http.Response, error) {
 		active.Add(1)
 		defer active.Add(-1)
 		if req.URL.Query().Get("partNumber") == "1" {
+			attempts.Add(1)
 			select {
 			case <-started:
 			case <-req.Context().Done():
@@ -163,11 +164,14 @@ func TestMultipartWorkersCancelAndJoinOnFailure(t *testing.T) {
 		return nil, req.Context().Err()
 	})
 	f := newMultipartTestFile(t, 8)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := newMultipartRegressionClient().uploadMultipartParts(ctx, bucket, &UploadOSSParams{}, oss.InitiateMultipartUploadResult{Key: "file", UploadID: "upload"}, f, []oss.FileChunk{{Number: 1, Offset: 0, Size: 4}, {Number: 2, Offset: 4, Size: 4}}, 2, time.Hour, nil)
 	if err == nil || !strings.Contains(err.Error(), "injected upload failure") {
 		t.Fatalf("expected upload failure, got %v", err)
+	}
+	if attempts.Load() != 5 {
+		t.Fatalf("upload attempts=%d, want 5", attempts.Load())
 	}
 	if active.Load() != 0 {
 		t.Fatalf("upload returned with %d active requests", active.Load())
