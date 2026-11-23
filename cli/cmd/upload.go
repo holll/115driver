@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/SheltonZhu/115driver/cli/internal/output"
 	"github.com/SheltonZhu/115driver/cli/internal/resolver"
@@ -37,7 +38,11 @@ var uploadCmd = &cobra.Command{
 		for _, localPath := range localPaths {
 			info, err := os.Stat(localPath)
 			if err != nil {
-				errors = append(errors, fmt.Sprintf("cannot access %s: %v", localPath, err))
+				if os.IsNotExist(err) {
+					errors = append(errors, fmt.Sprintf("local path does not exist: %q", localPath))
+				} else {
+					errors = append(errors, fmt.Sprintf("cannot access %s: %v", localPath, err))
+				}
 				continue
 			}
 
@@ -74,6 +79,9 @@ var uploadCmd = &cobra.Command{
 			"files_skipped":   filesSkipped,
 		}
 		if len(errors) > 0 {
+			if !jsonOutput {
+				return &exitError{code: output.ExitError, msg: strings.Join(errors, "\n       ")}
+			}
 			result["errors"] = errors
 			errMsg := fmt.Sprintf("%d of %d source(s) failed", len(errors), len(localPaths))
 			return &exitError{code: output.ExitError, msg: errMsg, data: result}

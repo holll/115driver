@@ -29,17 +29,17 @@ func cliTestResponse(body string) (*http.Response, error) {
 }
 
 // 运行真实 Execute 错误输出路径，所有 HTTP 请求由离线替身接管。
-func executeOfflineCLI(t *testing.T, transport cliTestTransport, args ...string) (int, string) {
+func executeOfflineCLI(t *testing.T, jsonMode bool, transport cliTestTransport, args ...string) (int, string) {
 	t.Helper()
 	oldRoot, oldFactory := rootCmd, newCLIClient
 	oldClient, oldPrinter := client, printer
 	oldCookie, oldJSON, oldDebug := cookieFlag, jsonOutput, debugMode
-	oldArgs, oldStdout := os.Args, os.Stdout
+	oldArgs, oldStdout, oldStderr := os.Args, os.Stdout, os.Stderr
 	t.Cleanup(func() {
 		rootCmd, newCLIClient = oldRoot, oldFactory
 		client, printer = oldClient, oldPrinter
 		cookieFlag, jsonOutput, debugMode = oldCookie, oldJSON, oldDebug
-		os.Args, os.Stdout = oldArgs, oldStdout
+		os.Args, os.Stdout, os.Stderr = oldArgs, oldStdout, oldStderr
 	})
 	rootCmd = &cobra.Command{Use: "115driver", SilenceErrors: true, SilenceUsage: true, PersistentPreRunE: oldRoot.PersistentPreRunE}
 	upload := &cobra.Command{Use: uploadCmd.Use, Args: uploadCmd.Args, RunE: uploadCmd.RunE}
@@ -50,17 +50,21 @@ func executeOfflineCLI(t *testing.T, transport cliTestTransport, args ...string)
 		c.Client.SetTransport(transport)
 		return c
 	}
-	cookieFlag, jsonOutput, debugMode = "UID=1_A1;CID=test;SEID=test;KID=test", true, false
+	cookieFlag, jsonOutput, debugMode = "UID=1_A1;CID=test;SEID=test;KID=test", jsonMode, false
 	printer = nil
 	os.Args = []string{"115driver"}
-	f, err := os.CreateTemp(t.TempDir(), "stdout")
+	f, err := os.CreateTemp(t.TempDir(), "output")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	os.Stdout = f
+	if jsonMode {
+		os.Stdout = f
+	} else {
+		os.Stderr = f
+	}
 	code := Execute()
-	os.Stdout = oldStdout
+	os.Stdout, os.Stderr = oldStdout, oldStderr
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +96,7 @@ func TestExecuteUploadPartialFailurePrintsOneJSON(t *testing.T) {
 	}
 	missing := filepath.Join(root, "missing")
 	calls := 0
-	code, text := executeOfflineCLI(t, func(r *http.Request) (*http.Response, error) {
+	code, text := executeOfflineCLI(t, true, func(r *http.Request) (*http.Response, error) {
 		calls++
 		switch r.URL.Path {
 		case "/files/add":
@@ -123,6 +127,23 @@ func TestExecuteUploadPartialFailurePrintsOneJSON(t *testing.T) {
 	}
 }
 
+func TestExecuteUploadReportsMissingSourcesOnStderr(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing")
+	unexpanded := filepath.Join(root, "missing-dir", "*")
+	code, text := executeOfflineCLI(t, false, func(*http.Request) (*http.Response, error) {
+		return cliTestResponse(`{"state":true,"data":{"user_id":1}}`)
+	}, "upload", missing, unexpanded, "/")
+	if code != output.ExitError {
+		t.Fatalf("exit code=%d, want %d", code, output.ExitError)
+	}
+	for _, source := range []string{missing, unexpanded} {
+		if want := fmt.Sprintf("local path does not exist: %q", source); !strings.Contains(text, want) {
+			t.Errorf("stderr=%q, missing %q", text, want)
+		}
+	}
+}
+
 func TestExecuteGetUserErrorClassification(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -137,7 +158,7 @@ func TestExecuteGetUserErrorClassification(t *testing.T) {
 		{name: "other API error", body: `{"state":false,"errno":123456,"error":"service error"}`, wantCode: output.ExitAuth},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			code, text := executeOfflineCLI(t, func(*http.Request) (*http.Response, error) {
+			code, text := executeOfflineCLI(t, true, func(*http.Request) (*http.Response, error) {
 				if tt.err != nil {
 					return nil, tt.err
 				}
